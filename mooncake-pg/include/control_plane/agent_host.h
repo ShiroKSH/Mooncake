@@ -11,22 +11,17 @@
 #include <unordered_map>
 #include <vector>
 
-#include <c10/util/intrusive_ptr.h>
-#include <torch/csrc/distributed/c10d/Store.hpp>
-
 #include "agent.h"
 #include "rpc.h"
 #include "serialized_executor.h"
 #include "link_manager.h"
 
 #include "pg_utils.h"
-#include "mooncake_backend.h"
-
 namespace mooncake {
 
 class RpcServer;
 class RpcClient;
-class MooncakeBackend;
+class MooncakeCommunicator;
 
 // =========================================================================
 // Control Plane Architecture (Agent side)
@@ -35,7 +30,7 @@ class MooncakeBackend;
 // Each rank runs one AgentHost.  It owns the AgentStateMachine (pure state
 // machine) and drives it via a SerializedExecutor.
 //
-//     MooncakeBackend                         AgentHost
+//   MooncakeCommunicator                      AgentHost
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
 //   | registerGroup   |-> post() --->| agent_.registerGroup()    |
@@ -55,11 +50,12 @@ class MooncakeBackend;
 //                              | runEffects()                   |
 //                              |  EnablePeerProbe -> LinkManager|
 //                              |  SendLinkEventReport -> RPC    |
-//                              |  ApplyViewToBackend -> backend |
+//                              | ApplyViewToCommunicator -> comm|
 //                              |              ...               |
 //                              +--------------------------------+
 
-// AgentInterface - control-plane service interface exposed to MooncakeBackend.
+// AgentInterface - control-plane service interface exposed to
+// MooncakeCommunicator.
 class AgentInterface {
    public:
     virtual ~AgentInterface() = default;
@@ -79,9 +75,9 @@ class AgentInterface {
                                   std::vector<GlobalRank> rank_order,
                                   GroupBootstrapIdResolvePolicy resolve_policy,
                                   bool auto_deactivate,
-                                  MooncakeBackend* backend) = 0;
+                                  MooncakeCommunicator* communicator) = 0;
 
-    virtual void detachBackend(GroupId group_id) = 0;
+    virtual void detachCommunicator(GroupId group_id) = 0;
 
     virtual void unregisterGroup(GroupId group_id) = 0;
 
@@ -130,7 +126,7 @@ class AgentHost : public AgentInterface {
         std::chrono::seconds(5);
     static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
-    AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
+    AgentHost(std::string coordinator_addr, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
@@ -150,8 +146,8 @@ class AgentHost : public AgentInterface {
                           std::vector<GlobalRank> rank_order,
                           GroupBootstrapIdResolvePolicy resolve_policy,
                           bool auto_deactivate,
-                          MooncakeBackend* backend) override;
-    void detachBackend(GroupId group_id) override;
+                          MooncakeCommunicator* communicator) override;
+    void detachCommunicator(GroupId group_id) override;
     void unregisterGroup(GroupId group_id) override;
     void confirmReadyForActivation(GroupId group_id) override;
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
@@ -178,7 +174,6 @@ class AgentHost : public AgentInterface {
 
     LinkManager& link_manager_;
 
-    c10::intrusive_ptr<c10d::Store> store_;
     std::string host_ip_;
     GlobalRank rank_;
     int max_world_size_;
@@ -210,17 +205,16 @@ class AgentHost : public AgentInterface {
 
     // rank_active_promises_[group_id][rank] is fulfilled when a ViewUpdate
     // push activates `rank` in `group_id`.  Used by extension/replacement
-    // ranks to block in MooncakeBackend::joinGroup() until recover_ranks
-    // activates them.
+    // ranks to block in MooncakeCommunicator::joinGroup() until activation.
     std::unordered_map<
         GroupId,
         std::unordered_map<GlobalRank,
                            std::vector<std::shared_ptr<std::promise<void>>>>>
         rank_active_promises_;
 
-    // Backend registry: for view application and link reset.
+    // Communicator registry: for view application and link reset.
     // Accessed only from the executor thread.
-    std::unordered_map<GroupId, MooncakeBackend*> backends_;
+    std::unordered_map<GroupId, MooncakeCommunicator*> communicators_;
 
     void startAgentRegistration(bool start_new_session = false);
     bool shouldLogAgentRegistrationError();
@@ -237,16 +231,16 @@ class AgentHost : public AgentInterface {
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>
-    void forEachBackend(F&& func) {
-        for (auto& [group_id, backend] : backends_) {
-            func(backend);  // backend is MooncakeBackend*
+    void forEachCommunicator(F&& func) {
+        for (auto& [group_id, communicator] : communicators_) {
+            func(communicator);
         }
     }
     template <typename F>
-    void withBackend(GroupId group_id, F&& func) {
-        auto it = backends_.find(group_id);
-        if (it != backends_.end()) {
-            func(it->second);  // it->second is MooncakeBackend*
+    void withCommunicator(GroupId group_id, F&& func) {
+        auto it = communicators_.find(group_id);
+        if (it != communicators_.end()) {
+            func(it->second);
         }
     }
 };

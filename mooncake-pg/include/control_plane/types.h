@@ -27,7 +27,7 @@ constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
 
 // Resolves a registration only against runtime groups stored under the same
-// GroupBootstrapId, i.e. the same backend type and PyTorch group_id.
+// GroupBootstrapId, i.e. the same device kind and PyTorch group id.
 // An exact match requires both rank_order and max_group_size to be equal.
 //
 // CreateOrAttach:

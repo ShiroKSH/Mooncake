@@ -30,9 +30,9 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    effects.push_back(ApplyViewToBackend{view, global_rank_states_,
-                                         global_rank_epochs_,
-                                         std::move(activatable)});
+    effects.push_back(ApplyViewToCommunicator{view, global_rank_states_,
+                                              global_rank_epochs_,
+                                              std::move(activatable)});
 }
 
 AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
@@ -230,7 +230,7 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
 
     it->second = view;
 
-    // Must come AFTER ApplyViewToBackend: refreshSegmentID requires
+    // Must come AFTER ApplyViewToCommunicator: refreshSegmentID requires
     // latest meta_->rank_order.
     for (auto gr : need_segment_refresh) {
         effects.push_back(NotifyLinkRefreshed{gr});

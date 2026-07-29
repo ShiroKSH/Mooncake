@@ -7,7 +7,7 @@
 
 #include <glog/logging.h>
 
-#include "mooncake_backend.h"
+#include "mooncake_communicator.h"
 #include "control_plane/link_manager.h"
 #include "control_plane/rpc_runtime.h"
 
@@ -46,17 +46,17 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     host_.postViewUpdate(std::move(ctx), std::move(push));
 }
 
-AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
-                     const std::string& host_ip, GlobalRank rank,
-                     int max_world_size, LinkManager& link_manager,
+AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
+                     GlobalRank rank, int max_world_size,
+                     LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
       link_manager_(link_manager),
-      store_(std::move(store)),
       host_ip_(host_ip),
       rank_(rank),
       max_world_size_(max_world_size),
+      coordinator_addr_(std::move(coordinator_addr)),
       agent_session_id_(generateInitialAgentSessionId()),
       rpc_client_(std::make_unique<RpcClient>(
           std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -88,27 +88,9 @@ void AgentHost::start() {
         LOG(FATAL) << "AgentHost: failed to start RPC server rank=" << rank_;
     }
 
-    BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
-        AgentHost::kCoordinatorAddrPollInterval));
-
-    bool found = waiter.wait_for(AgentHost::kCoordinatorAddrTimeout, [this]() {
-        try {
-            store_->wait({"coordinator_addr"});
-            coordinator_addr_ = store_->get_to_str("coordinator_addr");
-            return !coordinator_addr_.empty();
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "AgentHost: store access failed rank=" << rank_
-                         << ": " << e.what();
-        }
-        return false;
-    });
-
-    if (!found) {
-        LOG(FATAL) << "AgentHost: timed out after "
-                   << std::chrono::duration_cast<std::chrono::seconds>(
-                          AgentHost::kCoordinatorAddrTimeout)
-                          .count()
-                   << "s waiting for coordinator_addr in Store";
+    if (coordinator_addr_.empty()) {
+        throw std::invalid_argument(
+            "AgentHost: coordinator address must not be empty");
     }
 
     executor_.setTickCallback([this]() { tick(); });
@@ -254,11 +236,11 @@ GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
                                  std::vector<GlobalRank> rank_order,
                                  GroupBootstrapIdResolvePolicy resolve_policy,
                                  bool auto_deactivate,
-                                 MooncakeBackend* backend) {
+                                 MooncakeCommunicator* communicator) {
     return executor_.postAndWait(
         [this, group_bootstrap_id = std::move(group_bootstrap_id),
          max_group_size, rank_order = std::move(rank_order), resolve_policy,
-         auto_deactivate, backend]() mutable {
+         auto_deactivate, communicator]() mutable {
             RegisterGroupRequest req;
             req.rank = rank_;
             req.agent_session_id = agent_.getAgentSessionId();
@@ -276,7 +258,7 @@ GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
 
             if (!resp.success) {
                 // A rejected group must not affect the process-scoped Agent.
-                // Return an empty id so this backend instance can remain
+                // Return an empty id so this communicator can remain
                 // group-scoped and execute local-only collectives.
                 LOG(WARNING)
                     << "AgentHost: registerGroup rejected for rank=" << rank_
@@ -287,14 +269,15 @@ GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
             }
 
             const auto& group_id = resp.view.group_id;
-            backends_.insert_or_assign(group_id, backend);
+            communicators_.insert_or_assign(group_id, communicator);
             runEffects(agent_.registerGroup(resp.view));
             return group_id;
         });
 }
 
-void AgentHost::detachBackend(GroupId group_id) {
-    executor_.postAndWait([this, group_id]() { backends_.erase(group_id); });
+void AgentHost::detachCommunicator(GroupId group_id) {
+    executor_.postAndWait(
+        [this, group_id]() { communicators_.erase(group_id); });
 }
 
 void AgentHost::unregisterGroup(GroupId group_id) {
@@ -559,10 +542,11 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
                     agent_registration_promises_.clear();
                 }
 
-                // Re-publish all local backends' endpoints after (re-)reg.
+                // Re-publish all local communicators' endpoints after (re-)reg.
                 // Old session endpoints were cleared by Coordinator.
-                forEachBackend([&](auto backend) {
-                    sendPublishEndpointRpc(backend->buildEndpointMetadata());
+                forEachCommunicator([&](auto communicator) {
+                    sendPublishEndpointRpc(
+                        communicator->buildEndpointMetadata());
                 });
             });
         });
@@ -653,26 +637,26 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     link_manager_.refreshPeerSegment(e.peer);
                 },
                 [this](const ResetPeerState& e) {
-                    for (auto& [group_id, backend] : backends_) {
+                    for (auto& [group_id, communicator] : communicators_) {
                         auto view = agent_.getGroupView(group_id);
                         for (int lr = 0;
                              lr < static_cast<int>(view.rank_order.size());
                              ++lr) {
                             if (view.rank_order[lr] == e.peer) {
-                                backend->onPeerLinkReset(lr);
+                                communicator->onPeerLinkReset(lr);
                                 break;
                             }
                         }
                     }
                 },
                 [this](const NotifyLinkRefreshed& e) {
-                    for (auto& [group_id, backend] : backends_) {
+                    for (auto& [group_id, communicator] : communicators_) {
                         auto view = agent_.getGroupView(group_id);
                         for (int lr = 0;
                              lr < static_cast<int>(view.rank_order.size());
                              ++lr) {
                             if (view.rank_order[lr] == e.peer) {
-                                backend->refreshSegmentID(lr);
+                                communicator->refreshSegmentID(lr);
                                 break;
                             }
                         }
@@ -692,10 +676,11 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         }
                     }
                 },
-                [this](const ApplyViewToBackend& e) {
-                    withBackend(e.view.group_id, [&](auto backend) {
-                        backend->applyViewUpdate(e.view, e.rank_states,
-                                                 e.rank_epochs, e.activatable);
+                [this](const ApplyViewToCommunicator& e) {
+                    withCommunicator(e.view.group_id, [&](auto communicator) {
+                        communicator->applyViewUpdate(e.view, e.rank_states,
+                                                      e.rank_epochs,
+                                                      e.activatable);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

@@ -3,15 +3,36 @@
 
 #pragma once
 
-#include <chrono>
-#include <thread>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <utility>
 
 // For PAUSE macro
 #include <transfer_engine.h>
 
 namespace mooncake {
+
+namespace detail {
+
+template <typename... Args>
+[[noreturn]] inline void throwPgCheckFailure(Args&&... args) {
+    std::ostringstream message;
+    (message << ... << std::forward<Args>(args));
+    throw std::runtime_error(message.str());
+}
+
+}  // namespace detail
+
+#define PG_CHECK(condition, ...)                                  \
+    do {                                                          \
+        if (!(condition)) {                                       \
+            ::mooncake::detail::throwPgCheckFailure(__VA_ARGS__); \
+        }                                                         \
+    } while (false)
 
 /**
  * @brief Configuration parameters for the BackoffWaiter.

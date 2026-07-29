@@ -270,7 +270,7 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct ApplyViewToBackend {
+struct ApplyViewToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
@@ -301,7 +301,7 @@ struct NotifyRanksActivated {
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
                  SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToBackend, ResetPeerState,
+                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
                  RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
                  NotifyRanksActivated>;
 
